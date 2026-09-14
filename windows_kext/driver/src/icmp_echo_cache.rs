@@ -39,7 +39,7 @@ struct EchoKey {
 #[derive(Clone, Copy)]
 struct EchoEntry {
     process_id: u64,
-    /// Milliseconds since boot, from `get_system_timestamp_ms`.
+    /// Milliseconds since boot, from `get_monotonic_timestamp_ms`.
     inserted_at_ms: u64,
 }
 
@@ -66,9 +66,9 @@ const ENTRY_TTL_MS: u64 = 10_000;
 const MAX_ENTRIES: usize = 512;
 
 pub struct IcmpEchoCache {
-    /// A map rather than a flat array: unlike the endpoint PID table, the key space
-    /// here includes a full address, so it cannot be indexed directly. The map
-    /// stays small because entries are removed as soon as they are used.
+    /// A map is used because the key space includes a full address and cannot be
+    /// indexed directly. The map stays small because entries are removed as soon
+    /// as they are used.
     entries: BTreeMap<EchoKey, EchoEntry>,
     lock: RwSpinLock,
 }
@@ -93,7 +93,7 @@ impl IcmpEchoCache {
             return;
         }
 
-        let now = wdk::utils::get_system_timestamp_ms();
+        let now = wdk::utils::get_monotonic_timestamp_ms();
         let key = EchoKey {
             remote_address,
             identifier,
@@ -134,6 +134,10 @@ impl IcmpEchoCache {
         remote_address: IpAddress,
         identifier: u16,
     ) -> Option<u64> {
+        // Expiry is checked on read as well as on insert: an entry can sit here
+        // long after its TTL if no insert forced a cleanup in between.
+        let now = wdk::utils::get_monotonic_timestamp_ms();
+
         let key = EchoKey {
             remote_address,
             identifier,
@@ -142,14 +146,17 @@ impl IcmpEchoCache {
         let _guard = self.lock.write_lock();
         let entry = self.entries.remove(&key)?;
 
-        // Expiry is checked on read as well as on insert: an entry can sit here
-        // long after its TTL if no insert forced a cleanup in between.
-        let now = wdk::utils::get_system_timestamp_ms();
         if now.saturating_sub(entry.inserted_at_ms) > ENTRY_TTL_MS {
             return None;
         }
 
         Some(entry.process_id)
+    }
+
+    #[allow(dead_code)]
+    pub fn get_entries_count(&self) -> usize {
+        let _guard = self.lock.read_lock();
+        self.entries.len()
     }
 
     /// Drops every entry past its TTL.
@@ -165,7 +172,7 @@ impl IcmpEchoCache {
     /// Only expired entries go. A full clear would discard requests still in
     /// flight, and their replies would then be reported as PID 0.
     pub fn clean_expired_entries(&mut self) {
-        let now = wdk::utils::get_system_timestamp_ms();
+        let now = wdk::utils::get_monotonic_timestamp_ms();
 
         let _guard = self.lock.write_lock();
         self.entries

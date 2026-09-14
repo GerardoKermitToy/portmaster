@@ -1,7 +1,4 @@
-use alloc::{
-    boxed::Box,
-    string::{String, ToString},
-};
+use alloc::string::{String, ToString};
 use core::{
     fmt::{Debug, Display},
     sync::atomic::{AtomicU64, Ordering},
@@ -11,9 +8,47 @@ use smoltcp::wire::{IpAddress, IpProtocol, Ipv4Address, Ipv6Address};
 
 use crate::connection_map::Key;
 
-pub static PM_DNS_PORT:       u16 = 53;
-pub static PM_SPN_PORT:       u16 = 717;
-pub static PM_SPLIT_TUN_PORT: u16 = 719;
+pub const PM_DNS_PORT: u16 = 53;
+pub const PM_SPN_PORT: u16 = 717;
+pub const PM_SPLIT_TUN_PORT: u16 = 719;
+
+static NEXT_CONNECTION_INSTANCE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_connection_instance_id() -> u64 {
+    loop {
+        let id = NEXT_CONNECTION_INSTANCE_ID.fetch_add(1, Ordering::Relaxed);
+        if id != 0 {
+            return id;
+        }
+    }
+}
+
+#[inline]
+fn ipv6_address_key(address: Ipv6Address) -> (u64, u64) {
+    let bytes = address.0;
+    (
+        u64::from_be_bytes([
+            bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+        ]),
+        u64::from_be_bytes([
+            bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15],
+        ]),
+    )
+}
+
+#[inline]
+fn get_monotonic_timestamp_ms() -> u64 {
+    #[cfg(not(test))]
+    {
+        wdk::utils::get_monotonic_timestamp_ms()
+    }
+
+    #[cfg(test)]
+    {
+        // Kernel time is unavailable to the user-mode unit-test executable.
+        0
+    }
+}
 
 /// Returns true if `remote_port` is a port that `redirect_equals` can match on.
 ///
@@ -96,9 +131,18 @@ impl Debug for Direction {
 pub struct ConnectionExtra {
     pub(crate) end_timestamp: u64,
     pub(crate) direction: Direction,
+    /// True when a native WFP endpoint or flow can identify this exact cache
+    /// generation and report when it ends. Outbound packet-layer fallback entries
+    /// have no such identity and are expired by periodic cleanup instead.
+    pub(crate) native_lifecycle: bool,
 }
 
 pub trait Connection {
+    /// Compact address representation used by the connection-cache index.
+    /// IPv4 and IPv6 live in separate maps, so the index does not need the
+    /// discriminant and storage overhead of `IpAddress`.
+    type RemoteAddressKey: Copy + Ord;
+
     fn redirect_info(&self) -> Option<RedirectInfo> {
         let redirect_address = if self.is_ipv6() {
             IpAddress::Ipv6(Ipv6Address::LOOPBACK)
@@ -146,18 +190,6 @@ pub trait Connection {
         }
     }
 
-    /// Returns the remote endpoint as an orderable tuple.
-    ///
-    /// This is the coarse sort key of the per-port vectors in `ConnectionMap`.
-    /// Every connection that `remote_equals` can accept must compare equal here,
-    /// but the converse is intentionally not true: entries with the same remote
-    /// endpoint can still differ in local address and are disambiguated by
-    /// `remote_equals`. `IpAddress` orders by variant first, so a key of the wrong
-    /// address family does not enter the candidate range.
-    fn remote_key(&self) -> (IpAddress, u16) {
-        (self.get_remote_address(), self.get_remote_port())
-    }
-
     /// Returns true if the connection has the same local and remote endpoint as
     /// the given key. The map already groups by protocol and local port, but the
     /// local address still has to be checked here: two local addresses can use
@@ -176,13 +208,19 @@ pub trait Connection {
     fn get_local_port(&self) -> u16;
     /// Returns the remote address of the connection.
     fn get_remote_address(&self) -> IpAddress;
+    /// Returns the compact remote-address index key.
+    fn get_remote_address_key(&self) -> Self::RemoteAddressKey;
+    /// Converts a tuple's remote address to the family-specific index key.
+    fn remote_address_key(key: &Key) -> Option<Self::RemoteAddressKey>;
     /// Returns the remote port of the connection.
     fn get_remote_port(&self) -> u16;
     /// Returns true if the connection is an IPv6 connection.
     fn is_ipv6(&self) -> bool;
     /// Returns the direction of the connection.
     fn get_direction(&self) -> Direction;
-    // Returns the process id of the connection.
+    /// Returns the unique cache-instance ID of the connection.
+    fn get_instance_id(&self) -> u64;
+    /// Returns the process ID of the connection.
     fn get_process_id(&self) -> u64;
     /// Ends the connection.
     fn end(&mut self, timestamp: u64);
@@ -196,6 +234,10 @@ pub trait Connection {
     fn get_last_accessed_time(&self) -> u64;
     /// Sets the timestamp when the connection was last accessed.
     fn set_last_accessed_time(&self, timestamp: u64);
+    /// Returns whether native WFP state can report this connection's end.
+    fn has_native_lifecycle(&self) -> bool;
+    /// Marks a fallback entry as owned by a native WFP lifecycle association.
+    fn mark_native_lifecycle(&mut self);
 }
 
 pub struct ConnectionV4 {
@@ -206,8 +248,9 @@ pub struct ConnectionV4 {
     pub(crate) remote_port: u16,
     pub(crate) verdict: Verdict,
     pub(crate) process_id: u64,
+    pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
-    pub(crate) extra: Box<ConnectionExtra>,
+    pub(crate) extra: ConnectionExtra,
 }
 
 pub struct ConnectionV6 {
@@ -218,8 +261,9 @@ pub struct ConnectionV6 {
     pub(crate) remote_port: u16,
     pub(crate) verdict: Verdict,
     pub(crate) process_id: u64,
+    pub(crate) instance_id: u64,
     pub(crate) last_accessed_timestamp: AtomicU64,
-    pub(crate) extra: Box<ConnectionExtra>,
+    pub(crate) extra: ConnectionExtra,
 }
 
 #[derive(Debug)]
@@ -235,6 +279,23 @@ pub struct RedirectInfo {
 impl ConnectionV4 {
     /// Creates a new ipv4 connection from the given key.
     pub fn from_key(key: &Key, process_id: u64, direction: Direction) -> Result<Self, String> {
+        Self::from_key_with_lifecycle(key, process_id, direction, true)
+    }
+
+    pub(crate) fn from_untracked_key(
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+    ) -> Result<Self, String> {
+        Self::from_key_with_lifecycle(key, process_id, direction, false)
+    }
+
+    fn from_key_with_lifecycle(
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+        native_lifecycle: bool,
+    ) -> Result<Self, String> {
         let IpAddress::Ipv4(local_address) = key.local_address else {
             return Err("wrong ip address version".to_string());
         };
@@ -243,7 +304,7 @@ impl ConnectionV4 {
             return Err("wrong ip address version".to_string());
         };
 
-        let timestamp = wdk::utils::get_system_timestamp_ms();
+        let timestamp = get_monotonic_timestamp_ms();
 
         Ok(Self {
             protocol: key.protocol,
@@ -253,16 +314,20 @@ impl ConnectionV4 {
             remote_port: key.remote_port,
             verdict: Verdict::Undecided,
             process_id,
+            instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
-            extra: Box::new(ConnectionExtra {
+            extra: ConnectionExtra {
                 direction,
                 end_timestamp: 0,
-            }),
+                native_lifecycle,
+            },
         })
     }
 }
 
 impl Connection for ConnectionV4 {
+    type RemoteAddressKey = u32;
+
     fn remote_equals(&self, key: &Key) -> bool {
         if self.protocol != key.protocol
             || self.local_port != key.local_port
@@ -341,12 +406,29 @@ impl Connection for ConnectionV4 {
         IpAddress::Ipv4(self.remote_address)
     }
 
+    #[inline]
+    fn get_remote_address_key(&self) -> Self::RemoteAddressKey {
+        u32::from_be_bytes(self.remote_address.0)
+    }
+
+    #[inline]
+    fn remote_address_key(key: &Key) -> Option<Self::RemoteAddressKey> {
+        match key.remote_address {
+            IpAddress::Ipv4(address) => Some(u32::from_be_bytes(address.0)),
+            IpAddress::Ipv6(_) => None,
+        }
+    }
+
     fn get_remote_port(&self) -> u16 {
         self.remote_port
     }
 
     fn is_ipv6(&self) -> bool {
         false
+    }
+
+    fn get_instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     fn get_process_id(&self) -> u64 {
@@ -373,6 +455,14 @@ impl Connection for ConnectionV4 {
         self.last_accessed_timestamp
             .store(timestamp, Ordering::Relaxed);
     }
+
+    fn has_native_lifecycle(&self) -> bool {
+        self.extra.native_lifecycle
+    }
+
+    fn mark_native_lifecycle(&mut self) {
+        self.extra.native_lifecycle = true;
+    }
 }
 
 impl Clone for ConnectionV4 {
@@ -385,6 +475,7 @@ impl Clone for ConnectionV4 {
             remote_port: self.remote_port,
             verdict: self.verdict,
             process_id: self.process_id,
+            instance_id: self.instance_id,
             last_accessed_timestamp: AtomicU64::new(
                 self.last_accessed_timestamp.load(Ordering::Relaxed),
             ),
@@ -396,6 +487,23 @@ impl Clone for ConnectionV4 {
 impl ConnectionV6 {
     /// Creates a new ipv6 connection from the given key.
     pub fn from_key(key: &Key, process_id: u64, direction: Direction) -> Result<Self, String> {
+        Self::from_key_with_lifecycle(key, process_id, direction, true)
+    }
+
+    pub(crate) fn from_untracked_key(
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+    ) -> Result<Self, String> {
+        Self::from_key_with_lifecycle(key, process_id, direction, false)
+    }
+
+    fn from_key_with_lifecycle(
+        key: &Key,
+        process_id: u64,
+        direction: Direction,
+        native_lifecycle: bool,
+    ) -> Result<Self, String> {
         let IpAddress::Ipv6(local_address) = key.local_address else {
             return Err("wrong ip address version".to_string());
         };
@@ -403,7 +511,7 @@ impl ConnectionV6 {
         let IpAddress::Ipv6(remote_address) = key.remote_address else {
             return Err("wrong ip address version".to_string());
         };
-        let timestamp = wdk::utils::get_system_timestamp_ms();
+        let timestamp = get_monotonic_timestamp_ms();
 
         Ok(Self {
             protocol: key.protocol,
@@ -413,16 +521,20 @@ impl ConnectionV6 {
             remote_port: key.remote_port,
             verdict: Verdict::Undecided,
             process_id,
+            instance_id: next_connection_instance_id(),
             last_accessed_timestamp: AtomicU64::new(timestamp),
-            extra: Box::new(ConnectionExtra {
+            extra: ConnectionExtra {
                 direction,
                 end_timestamp: 0,
-            }),
+                native_lifecycle,
+            },
         })
     }
 }
 
 impl Connection for ConnectionV6 {
+    type RemoteAddressKey = (u64, u64);
+
     fn remote_equals(&self, key: &Key) -> bool {
         if self.protocol != key.protocol
             || self.local_port != key.local_port
@@ -500,12 +612,29 @@ impl Connection for ConnectionV6 {
         IpAddress::Ipv6(self.remote_address)
     }
 
+    #[inline]
+    fn get_remote_address_key(&self) -> Self::RemoteAddressKey {
+        ipv6_address_key(self.remote_address)
+    }
+
+    #[inline]
+    fn remote_address_key(key: &Key) -> Option<Self::RemoteAddressKey> {
+        match key.remote_address {
+            IpAddress::Ipv4(_) => None,
+            IpAddress::Ipv6(address) => Some(ipv6_address_key(address)),
+        }
+    }
+
     fn get_remote_port(&self) -> u16 {
         self.remote_port
     }
 
     fn is_ipv6(&self) -> bool {
         true
+    }
+
+    fn get_instance_id(&self) -> u64 {
+        self.instance_id
     }
 
     fn get_process_id(&self) -> u64 {
@@ -532,6 +661,14 @@ impl Connection for ConnectionV6 {
         self.last_accessed_timestamp
             .store(timestamp, Ordering::Relaxed);
     }
+
+    fn has_native_lifecycle(&self) -> bool {
+        self.extra.native_lifecycle
+    }
+
+    fn mark_native_lifecycle(&mut self) {
+        self.extra.native_lifecycle = true;
+    }
 }
 
 impl Clone for ConnectionV6 {
@@ -544,6 +681,7 @@ impl Clone for ConnectionV6 {
             remote_port: self.remote_port,
             verdict: self.verdict,
             process_id: self.process_id,
+            instance_id: self.instance_id,
             last_accessed_timestamp: AtomicU64::new(
                 self.last_accessed_timestamp.load(Ordering::Relaxed),
             ),
